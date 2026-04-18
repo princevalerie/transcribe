@@ -1,45 +1,33 @@
 import os
-import base64
+import json
 import tempfile
-import subprocess
-import glob
-import shutil
 from pathlib import Path
 
 import streamlit as st
-from openai import OpenAI, APIStatusError
 from dotenv import load_dotenv
-import imageio_ffmpeg
-
-# ═══════════════════════════════════════════════════════════════
-# FIX FFMPEG / FFPROBE PATH (auto-detect dari imageio-ffmpeg)
-# ═══════════════════════════════════════════════════════════════
-_FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-_FFMPEG_DIR = os.path.dirname(_FFMPEG_EXE)
-
-# Cari ffprobe di folder yang sama dengan ffmpeg
-_FFPROBE_CANDIDATES = glob.glob(os.path.join(_FFMPEG_DIR, "*ffprobe*"))
-_FFPROBE_EXE = _FFPROBE_CANDIDATES[0] if _FFPROBE_CANDIDATES else shutil.which("ffprobe")
-
-# Setup pydub untuk pakai binary dari imageio-ffmpeg
-from pydub import AudioSegment
-AudioSegment.converter = _FFMPEG_EXE
-if _FFPROBE_EXE and os.path.exists(_FFPROBE_EXE):
-    AudioSegment.ffprobe = _FFPROBE_EXE
-else:
-    AudioSegment.ffprobe = "ffprobe"
+from google import genai
+from google.genai import types
 
 # ═══════════════════════════════════════════════════════════════
 # LOAD ENV & INIT CLIENT
 # ═══════════════════════════════════════════════════════════════
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+if not GOOGLE_API_KEY:
+    st.error("❌ GOOGLE_API_KEY tidak ditemukan. Silakan set di file .env atau environment variables.")
+    st.info("Dapatkan API Key di: https://aistudio.google.com/app/apikey")
+    st.stop()
+
+client = genai.Client(api_key=GOOGLE_API_KEY)
 
 # ═══════════════════════════════════════════════════════════════
 # STREAMLIT CONFIG
 # ═══════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="AAC to Text Transcriber",
+    page_title="Gemini AAC Transcriber",
     page_icon="🎙️",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -47,356 +35,415 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; margin-bottom: 1rem; }
+    .main-header { font-size: 2.5rem; font-weight: bold; color: #4285f4; margin-bottom: 1rem; }
     .sub-header { font-size: 1.2rem; color: #666; margin-bottom: 2rem; }
-    .stButton>button { width: 100%; height: 3rem; font-size: 1.1rem; }
-    .transcript-box { background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 4px solid #1f77b4; }
-    .info-box { background-color: #e8f4f8; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
-    .status-ok { color: #28a745; font-weight: bold; }
-    .status-err { color: #dc3545; font-weight: bold; }
-    .status-warn { color: #ffc107; font-weight: bold; }
-    .fallback-banner { background-color: #fff3cd; border: 1px solid #ffc107; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
+    .stButton>button { width: 100%; height: 3rem; font-size: 1.1rem; background-color: #4285f4; color: white; }
+    .transcript-box { background-color: #f8f9fa; padding: 20px; border-radius: 10px; border-left: 4px solid #4285f4; }
+    .info-box { background-color: #e8f0fe; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+    .success-box { background-color: #e6f4ea; padding: 15px; border-radius: 8px; border-left: 4px solid #34a853; }
+    .warning-box { background-color: #fef3e8; padding: 15px; border-radius: 8px; border-left: 4px solid #f9ab00; }
 </style>
 """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════
-# AUDIO UTILITIES
+# GEMINI API FUNCTIONS
 # ═══════════════════════════════════════════════════════════════
 
-def convert_aac_to_supported(input_path: str, output_format: str = "mp3") -> str:
+def upload_audio_to_gemini(file_path: str, mime_type: str = None) -> types.File:
     """
-    Konversi AAC ke format yang didukung OpenAI (mp3/wav/m4a).
-    Layer 1: pydub | Layer 2: subprocess ffmpeg (fallback)
+    Upload audio file ke Google AI Studio / Gemini API.
+    Gemini support AAC, MP3, WAV, AIFF, OGG, FLAC langsung tanpa konversi [^2^].
     """
-    out_file = tempfile.mktemp(suffix=f".{output_format}")
-
-    # Layer 1: pydub
-    try:
-        audio = AudioSegment.from_file(input_path, format="aac")
-        audio.export(out_file, format=output_format)
-        return out_file
-    except Exception:
-        pass
-
-    # Layer 2: subprocess ffmpeg langsung
-    cmd = [
-        _FFMPEG_EXE,
-        "-y", "-hide_banner", "-loglevel", "error",
-        "-i", input_path,
-        "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
-        out_file
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Gagal konversi audio:\n{result.stderr}")
-    return out_file
-
-
-def split_audio_ffmpeg(file_path: str, chunk_size_mb: int = 20) -> list:
-    """
-    Split file besar pakai ffmpeg segment. Tidak butuh ffprobe.
-    """
-    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
-    if file_size_mb <= chunk_size_mb:
-        return [file_path]
-
-    segment_minutes = max(int(chunk_size_mb / 1.4), 3)
-    segment_time_sec = segment_minutes * 60
-
-    temp_dir = tempfile.mkdtemp()
-    base_name = Path(file_path).stem
-    pattern = os.path.join(temp_dir, f"{base_name}_%03d.mp3")
-
-    cmd = [
-        _FFMPEG_EXE,
-        "-y", "-hide_banner", "-loglevel", "error",
-        "-i", file_path,
-        "-f", "segment",
-        "-segment_time", str(segment_time_sec),
-        "-c", "copy",
-        "-reset_timestamps", "1",
-        pattern
-    ]
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Gagal split audio:\n{result.stderr}")
-
-    chunks = sorted([
-        os.path.join(temp_dir, f)
-        for f in os.listdir(temp_dir)
-        if f.startswith(base_name) and f.endswith(".mp3")
-    ])
-    return chunks
-
-
-def call_transcribe_api(file_path: str, model: str, response_format: str,
-                        prompt: str = None, language: str = None, attempt_fallback: bool = True):
-    """
-    Kirim file ke OpenAI Audio Transcriptions API.
-    Kalau 403 model_not_found, auto-fallback ke whisper-1.
-    """
-    with open(file_path, "rb") as audio:
-        kwargs = {
-            "model": model,
-            "file": audio,
-            "response_format": response_format,
+    # Auto-detect mime type kalau tidak disediakan
+    if mime_type is None:
+        ext = Path(file_path).suffix.lower()
+        mime_map = {
+            '.aac': 'audio/aac',
+            '.mp3': 'audio/mp3',
+            '.wav': 'audio/wav',
+            '.aiff': 'audio/aiff',
+            '.ogg': 'audio/ogg',
+            '.flac': 'audio/flac',
+            '.m4a': 'audio/mp4',
         }
-        # Prompt hanya untuk GPT-4o models
-        if prompt and model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
-            kwargs["prompt"] = prompt
-        if language:
-            kwargs["language"] = language
-
-        try:
-            return client.audio.transcriptions.create(**kwargs), model
-        except APIStatusError as e:
-            if e.status_code == 403 and "model_not_found" in str(e).lower() and attempt_fallback:
-                st.warning("⚠️ Model GPT-4o Transcribe tidak tersedia di project ini. Fallback ke `whisper-1`...")
-                # Retry dengan whisper-1
-                kwargs["model"] = "whisper-1"
-                # Hapus prompt kalau whisper-1 (tidak support sama baik)
-                if "prompt" in kwargs:
-                    del kwargs["prompt"]
-                return client.audio.transcriptions.create(**kwargs), "whisper-1"
-            else:
-                raise
+        mime_type = mime_map.get(ext, 'audio/aac')
+    
+    uploaded_file = client.files.upload(file=file_path, config={"mime_type": mime_type})
+    return uploaded_file
 
 
-def transcribe_diarize(file_path: str, response_format: str = "diarized_json"):
-    """Transkripsi dengan speaker diarization."""
-    with open(file_path, "rb") as audio:
-        return client.audio.transcriptions.create(
-            model="gpt-4o-transcribe-diarize",
-            file=audio,
-            response_format=response_format,
-            extra_body={"chunking_strategy": "auto"}
+def transcribe_audio_simple(uploaded_file: types.File, model: str, language_hint: str = None) -> str:
+    """
+    Transkripsi sederhana - hanya teks.
+    """
+    prompt = "Generate a complete and accurate transcript of the speech in this audio file."
+    
+    if language_hint:
+        prompt += f" The audio is primarily in {language_hint} language."
+    
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Content(
+                parts=[
+                    types.Part(file_data=types.FileData(file_uri=uploaded_file.uri)),
+                    types.Part(text=prompt)
+                ]
+            )
+        ]
+    )
+    
+    return response.text
+
+
+def transcribe_with_structure(uploaded_file: types.File, model: str, include_timestamps: bool = False, 
+                              include_speakers: bool = False, language: str = None) -> dict:
+    """
+    Transkripsi dengan structured output (JSON) - support timestamps dan speaker detection.
+    """
+    lang_instruction = f"The audio is in {language}." if language else "Auto-detect the language."
+    
+    prompt = f"""
+    Transcribe the audio file with the following requirements:
+    1. Provide accurate transcription of all speech content.
+    2. {lang_instruction}
+    3. Identify different speakers if multiple people are speaking.
+    4. Provide timestamps for each segment in MM:SS format.
+    
+    Return as structured JSON with segments containing: text, speaker (if identifiable), timestamp.
+    """
+    
+    if not include_timestamps:
+        prompt = prompt.replace("Provide timestamps for each segment in MM:SS format.", 
+                               "Do not include timestamps, just the text content.")
+    
+    if not include_speakers:
+        prompt = prompt.replace("Identify different speakers if multiple people are speaking.", 
+                               "Do not identify speakers, just transcribe the text.")
+    
+    # Define JSON schema untuk structured output
+    schema = types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "transcript": types.Schema(
+                type=types.Type.STRING,
+                description="The complete transcript text."
+            ),
+            "language": types.Schema(
+                type=types.Type.STRING,
+                description="Detected language of the audio."
+            ),
+            "segments": types.Schema(
+                type=types.Type.ARRAY,
+                description="List of transcribed segments.",
+                items=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "text": types.Schema(type=types.Type.STRING),
+                        "timestamp": types.Schema(type=types.Type.STRING),
+                        "speaker": types.Schema(type=types.Type.STRING)
+                    },
+                    required=["text"]
+                )
+            )
+        },
+        required=["transcript", "language"]
+    )
+    
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            types.Content(
+                parts=[
+                    types.Part(file_data=types.FileData(file_uri=uploaded_file.uri)),
+                    types.Part(text=prompt)
+                ]
+            )
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=schema
         )
+    )
+    
+    # Parse JSON response
+    try:
+        return json.loads(response.text)
+    except json.JSONDecodeError:
+        return {"transcript": response.text, "language": "unknown", "segments": []}
+
+
+def transcribe_advanced(uploaded_file: types.File, model: str, prompt_template: str = None,
+                       language: str = None) -> str:
+    """
+    Transkripsi dengan custom prompt untuk kontrol penuh.
+    """
+    if prompt_template:
+        prompt = prompt_template
+    else:
+        prompt = "Generate a transcript of the speech."
+    
+    if language:
+        prompt += f" The audio is in {language} language."
+    
+    response = client.models.generate_content(
+        model=model,
+        contents=[prompt, uploaded_file]
+    )
+    
+    return response.text
 
 
 # ═══════════════════════════════════════════════════════════════
 # UI
 # ═══════════════════════════════════════════════════════════════
 def main():
-    st.markdown('<div class="main-header">🎙️ AAC to Text Transcriber</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Transkripsi AAC ke teks pakai OpenAI — Auto fallback ke whisper-1</div>',
+    st.markdown('<div class="main-header">🎙️ Gemini AAC Transcriber</div>', unsafe_allow_html=True)
+    st.markdown('<div class="sub-header">Transkripsi audio AAC/MP3/WAV ke teks dengan Google Gemini AI</div>',
                 unsafe_allow_html=True)
-
+    
+    st.markdown(
+        '<div class="info-box">'
+        '✅ <b>Gemini API</b> mendukung AAC secara native tanpa konversi!<br>'
+        '📁 Format: AAC, MP3, WAV, AIFF, OGG, FLAC, M4A<br>'
+        '⏱️ Max duration: 9.5 hours per request [^2^]'
+        '</div>',
+        unsafe_allow_html=True
+    )
+    
     # ── Sidebar ──
     with st.sidebar:
         st.header("⚙️ Konfigurasi")
-
-        # Status tools
-        if os.path.exists(_FFMPEG_EXE):
-            st.markdown('<span class="status-ok">✅ FFmpeg ready</span>', unsafe_allow_html=True)
-        else:
-            st.markdown('<span class="status-err">❌ FFmpeg not found</span>', unsafe_allow_html=True)
-
-        if _FFPROBE_EXE and os.path.exists(_FFPROBE_EXE):
-            st.markdown('<span class="status-ok">✅ FFprobe ready</span>', unsafe_allow_html=True)
-        else:
-            st.markdown('<span class="status-warn">⚠️ FFprobe fallback mode</span>', unsafe_allow_html=True)
-
-        st.divider()
-
-        # Model selection dengan info akses
+        
         model = st.selectbox(
-            "Pilih Model",
+            "Pilih Model Gemini",
             options=[
-                "gpt-4o-mini-transcribe",
-                "gpt-4o-transcribe",
-                "gpt-4o-transcribe-diarize",
-                "whisper-1"
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-lite",
+                "gemini-2.5-flash-preview-05-20",
+                "gemini-2.5-pro-preview-05-06"
             ],
-            index=3,  # Default whisper-1 (paling aman)
-            help="whisper-1: tersedia semua | gpt-4o*: butuh akses khusus/beta"
+            index=0,
+            help="gemini-2.0-flash: cepat & hemat | gemini-2.5-pro: akurasi tertinggi"
         )
-
-        if model != "whisper-1":
-            st.markdown('<span class="status-warn">⚠️ Model ini butuh akses khusus. Akan auto-fallback ke whisper-1 kalau 403.</span>', unsafe_allow_html=True)
-
-        # Format output
-        if model == "gpt-4o-transcribe-diarize":
-            fmt_opts = ["diarized_json", "json", "text"]
-        elif model == "whisper-1":
-            fmt_opts = ["json", "text", "srt", "verbose_json", "vtt"]
-        else:
-            fmt_opts = ["text", "json"]
-        response_format = st.selectbox("Format Output", fmt_opts, index=0)
-
-        language = st.text_input(
-            "Kode Bahasa (ISO 639-1)",
-            value=os.getenv("LANGUAGE", "id"),
-            help="id=Indonesia, en=English, ja=Japanese, dst"
-        )
-
-        prompt = None
-        if model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
-            p = st.text_area(
-                "Prompt (opsional)",
-                placeholder="Contoh: 'Percakapan tentang teknologi AI...'",
-                help="Konteks untuk meningkatkan akurasi (hanya GPT-4o)"
-            )
-            prompt = p if p.strip() else None
-
-    # ── Main ──
-    st.markdown(
-        '<div class="info-box">📁 <b>Upload file audio</b> (AAC/MP3/WAV/M4A/MP4, max 25MB per chunk).</div>',
-        unsafe_allow_html=True)
-
-    uploaded = st.file_uploader(
-        "Pilih file",
-        type=["aac", "m4a", "mp3", "wav", "mp4", "mpeg", "webm"],
-        help="AAC akan dikonversi otomatis ke MP3"
-    )
-
-    if uploaded:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Nama", uploaded.name[:18] + "…" if len(uploaded.name) > 18 else uploaded.name)
-        size_mb = len(uploaded.getvalue()) / (1024 * 1024)
-        c2.metric("Ukuran", f"{size_mb:.2f} MB")
-        c3.metric("Tipe", uploaded.type or "audio/aac")
-
-        st.audio(uploaded, format="audio/aac")
-
+        
         st.divider()
+        st.subheader("🎯 Mode Transkripsi")
+        
+        mode = st.radio(
+            "Pilih mode:",
+            options=["Simple (Text Only)", "Structured (JSON with timestamps)", "Advanced (Custom Prompt)"],
+            index=0
+        )
+        
+        language = st.text_input(
+            "Kode Bahasa (opsional)",
+            placeholder="Contoh: Indonesian, English, Japanese",
+            help="Kosongkan untuk auto-detect"
+        )
+        
+        include_timestamps = False
+        include_speakers = False
+        
+        if mode == "Structured (JSON with timestamps)":
+            include_timestamps = st.checkbox("Include Timestamps", value=True)
+            include_speakers = st.checkbox("Include Speaker Labels", value=True)
+        
+        custom_prompt = None
+        if mode == "Advanced (Custom Prompt)":
+            custom_prompt = st.text_area(
+                "Custom Prompt",
+                placeholder="Contoh: 'Transcribe this meeting and extract all action items...'",
+                help="Prompt kustom untuk kontrol penuh output"
+            )
+        
+        st.divider()
+        st.info(f"Model: {model}\nMode: {mode}")
+    
+    # ── Main ──
+    uploaded = st.file_uploader(
+        "📁 Upload File Audio",
+        type=["aac", "mp3", "wav", "aiff", "ogg", "flac", "m4a"],
+        help="Gemini support semua format ini secara native!"
+    )
+    
+    if uploaded:
+        # Info file
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Nama File", uploaded.name[:20] + "..." if len(uploaded.name) > 20 else uploaded.name)
+        with col2:
+            size_mb = len(uploaded.getvalue()) / (1024 * 1024)
+            st.metric("Ukuran", f"{size_mb:.2f} MB")
+        with col3:
+            st.metric("Format", uploaded.type or "audio/aac")
+        
+        # Audio player
+        st.audio(uploaded, format=uploaded.type or "audio/aac")
+        
+        st.divider()
+        
         _, cbtn, _ = st.columns([1, 2, 1])
         with cbtn:
-            go = st.button("🚀 Mulai Transkripsi", type="primary", use_container_width=True)
-
-        if go:
-            with st.spinner("Memproses audio…"):
+            transcribe_btn = st.button("🚀 Mulai Transkripsi", type="primary", use_container_width=True)
+        
+        if transcribe_btn:
+            with st.spinner("Mengupload dan memproses audio..."):
                 try:
-                    # Simpan upload ke temp file
-                    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".aac")
-                    tmp_in.write(uploaded.getvalue())
-                    tmp_in.close()
-
-                    # Konversi ke MP3 (OpenAI nggak support AAC raw)
-                    need_convert = uploaded.name.lower().endswith(".aac")
-                    if need_convert:
-                        st.info("🔄 Mengkonversi AAC → MP3…")
-                        file_proc = convert_aac_to_supported(tmp_in.name, "mp3")
-                    else:
-                        file_proc = tmp_in.name
-
-                    # Split kalau >25 MB
-                    proc_size = os.path.getsize(file_proc) / (1024 * 1024)
-                    if proc_size > 25:
-                        st.warning(f"⚠️ File besar ({proc_size:.1f} MB), splitting…")
-                        chunks = split_audio_ffmpeg(file_proc, chunk_size_mb=20)
-                    else:
-                        chunks = [file_proc]
-
-                    # Proses tiap chunk
-                    full_result = []
-                    used_model = model
-                    bar = st.progress(0, text="Memulai…")
-
-                    for i, chunk in enumerate(chunks):
-                        bar.progress((i) / len(chunks), text=f"Chunk {i+1}/{len(chunks)}…")
-
-                        if model == "gpt-4o-transcribe-diarize":
-                            # Diarize tidak support fallback otomatis di sini (karena format beda)
-                            # Jika 403, user harus ganti manual ke whisper-1
-                            res = transcribe_diarize(chunk, response_format)
-                            used_model = "gpt-4o-transcribe-diarize"
-                        else:
-                            res, used_model = call_transcribe_api(
-                                chunk, model, response_format,
-                                prompt=prompt, language=language, attempt_fallback=True
+                    # Simpan file temporarily
+                    suffix = Path(uploaded.name).suffix
+                    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                    tmp_file.write(uploaded.getvalue())
+                    tmp_file.close()
+                    
+                    # Upload ke Gemini
+                    with st.status("📤 Uploading ke Google AI Studio...", expanded=True) as status:
+                        uploaded_file = upload_audio_to_gemini(tmp_file.name, uploaded.type)
+                        status.update(label=f"✅ Upload selesai! File ID: {uploaded_file.name}", state="complete")
+                    
+                    # Transkripsi berdasarkan mode
+                    with st.spinner("🧠 Gemini sedang mentranskripsi..."):
+                        if mode == "Simple (Text Only)":
+                            result = transcribe_audio_simple(
+                                uploaded_file, 
+                                model, 
+                                language_hint=language if language else None
                             )
-
-                        if response_format == "text":
-                            full_result.append(res)
-                        else:
-                            full_result.append(res.text if hasattr(res, "text") else str(res))
-
-                        # Hapus chunk temp (kecuali original)
-                        if chunk != file_proc:
-                            os.unlink(chunk)
-
-                    bar.progress(1.0, text="Selesai!")
-
-                    # Banner info model yang benar-benar digunakan
-                    if used_model != model:
-                        st.markdown(f'<div class="fallback-banner">ℹ️ Digunakan model: <b>{used_model}</b> (fallback dari {model})</div>', unsafe_allow_html=True)
-                    else:
-                        st.success(f"✅ Transkripsi selesai! (Model: {used_model})")
-
-                    st.divider()
-
-                    # ── Tampilkan hasil ──
-                    st.subheader("📝 Hasil Transkripsi")
-
-                    if response_format == "diarized_json":
-                        all_segments = []
-                        for r in full_result:
-                            if hasattr(r, 'segments'):
-                                all_segments.extend(r.segments)
-                            elif isinstance(r, dict) and 'segments' in r:
-                                all_segments.extend(r['segments'])
-
-                        if all_segments:
-                            for seg in all_segments:
-                                spk = getattr(seg, 'speaker', 'Unknown')
-                                txt = getattr(seg, 'text', '')
-                                s = getattr(seg, 'start', 0)
-                                e = getattr(seg, 'end', 0)
-                                col1, col2 = st.columns([1, 4])
-                                col1.markdown(f"**🎤 {spk}**")
-                                col1.caption(f"{s:.1f}s – {e:.1f}s")
-                                col2.info(txt)
-                        else:
-                            st.json([r for r in full_result])
-
-                    elif response_format in ("json", "verbose_json"):
-                        st.json(full_result[0] if len(full_result) == 1 else full_result)
-
-                    else:
-                        final_text = " ".join(full_result) if isinstance(full_result, list) else full_result
-                        if hasattr(final_text, 'text'):
-                            final_text = final_text.text
-                        st.markdown(f'<div class="transcript-box">{final_text}</div>', unsafe_allow_html=True)
-                        st.code(final_text, language="text")
-                        st.download_button(
-                            "💾 Download TXT", data=str(final_text),
-                            file_name=f"{uploaded.name.rsplit('.', 1)[0]}_transcript.txt",
-                            mime="text/plain"
-                        )
-
-                    # Cleanup
-                    os.unlink(tmp_in.name)
-                    if need_convert and os.path.exists(file_proc):
-                        os.unlink(file_proc)
-
-                except APIStatusError as api_err:
-                    if api_err.status_code == 403:
-                        st.error(f"❌ Error 403: API Key tidak punya akses ke model ini.")
-                        st.info("💡 Solusi: Pilih **whisper-1** di sidebar (tersedia untuk semua), atau cek billing/project di dashboard.openai.com")
-                    else:
-                        st.error(f"❌ API Error: {api_err}")
+                            
+                            st.success("✅ Transkripsi selesai!")
+                            st.divider()
+                            st.subheader("📝 Hasil Transkripsi")
+                            st.markdown(f'<div class="transcript-box">{result}</div>', unsafe_allow_html=True)
+                            st.code(result, language="text")
+                            
+                            # Download button
+                            st.download_button(
+                                "💾 Download TXT",
+                                data=result,
+                                file_name=f"{uploaded.name.rsplit('.', 1)[0]}_transcript.txt",
+                                mime="text/plain"
+                            )
+                            
+                        elif mode == "Structured (JSON with timestamps)":
+                            result = transcribe_with_structure(
+                                uploaded_file,
+                                model,
+                                include_timestamps=include_timestamps,
+                                include_speakers=include_speakers,
+                                language=language if language else None
+                            )
+                            
+                            st.success("✅ Transkripsi selesai!")
+                            st.divider()
+                            
+                            # Tampilkan info
+                            st.subheader("📊 Informasi")
+                            st.json({"language": result.get("language", "unknown"), "total_segments": len(result.get("segments", []))})
+                            
+                            # Tampilkan segments
+                            st.subheader("📝 Hasil Transkripsi")
+                            
+                            if result.get("segments"):
+                                for i, seg in enumerate(result["segments"]):
+                                    with st.container():
+                                        cols = st.columns([1, 4])
+                                        with cols[0]:
+                                            if include_timestamps and seg.get("timestamp"):
+                                                st.caption(f"⏱️ {seg['timestamp']}")
+                                            if include_speakers and seg.get("speaker"):
+                                                st.markdown(f"**🎤 {seg['speaker']}**")
+                                        with cols[1]:
+                                            st.info(seg.get("text", ""))
+                                        st.divider()
+                            else:
+                                st.markdown(f'<div class="transcript-box">{result.get("transcript", "")}</div>', 
+                                          unsafe_allow_html=True)
+                            
+                            # Download JSON
+                            st.download_button(
+                                "💾 Download JSON",
+                                data=json.dumps(result, indent=2, ensure_ascii=False),
+                                file_name=f"{uploaded.name.rsplit('.', 1)[0]}_transcript.json",
+                                mime="application/json"
+                            )
+                            
+                        else:  # Advanced mode
+                            result = transcribe_advanced(
+                                uploaded_file,
+                                model,
+                                prompt_template=custom_prompt,
+                                language=language if language else None
+                            )
+                            
+                            st.success("✅ Transkripsi selesai!")
+                            st.divider()
+                            st.subheader("📝 Hasil Transkripsi")
+                            st.markdown(f'<div class="transcript-box">{result}</div>', unsafe_allow_html=True)
+                            st.code(result, language="text")
+                            
+                            st.download_button(
+                                "💾 Download TXT",
+                                data=result,
+                                file_name=f"{uploaded.name.rsplit('.', 1)[0]}_transcript.txt",
+                                mime="text/plain"
+                            )
+                    
+                    # Cleanup temp file
+                    os.unlink(tmp_file.name)
+                    
+                    # Info tentang file di Gemini
+                    with st.expander("🔍 Detail File di Google AI Studio"):
+                        st.write(f"File URI: {uploaded_file.uri}")
+                        st.write(f"File Name: {uploaded_file.name}")
+                        st.info("File akan disimpan sementara di Google AI Studio untuk pemrosesan.")
+                        
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
-                    st.info("💡 Pastikan API key valid di file `.env`.")
-
+                    st.info("💡 Tips: Pastikan GOOGLE_API_KEY valid dan file tidak corrupt.")
+    
     else:
-        st.info("👆 Upload file audio untuk mulai")
-        with st.expander("📖 Cara Penggunaan & Troubleshooting"):
+        st.info("👆 Upload file audio untuk memulai transkripsi")
+        
+        with st.expander("📖 Cara Penggunaan & Fitur"):
             st.markdown("""
-            ### Langkah Penggunaan
-            1. Upload file `.aac` (atau MP3/WAV/M4A)
-            2. Pilih model — **whisper-1** paling aman (tersedia semua)
-            3. Klik **Mulai Transkripsi**
-
-            ### Error 403 / Model Not Found?
-            Model `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, dan `gpt-4o-transcribe-diarize` **butuh akses khusus** dan belum tersedia untuk semua project OpenAI.
-
-            **Solusi:**
-            - Pilih **whisper-1** (default) — tersedia untuk semua API key
-            - Kalau tetap mau GPT-4o, cek di [dashboard.openai.com](https://dashboard.openai.com) apakah model sudah di-enable
-
-            ### Error FFmpeg?
-            Sudah di-handle otomatis oleh `imageio-ffmpeg`. Tidak perlu install manual.
+            ### 🚀 Keunggulan Gemini API vs OpenAI:
+            
+            | Fitur | Gemini | OpenAI Whisper |
+            |-------|--------|----------------|
+            | **AAC Support** | ✅ Native, tanpa konversi | ❌ Perlu konversi ke MP3/WAV |
+            | **Max Duration** | 9.5 hours [^2^] | 25 MB (~20-30 menit) |
+            | **Speaker Detection** | ✅ Built-in | ❌ Limited |
+            | **Timestamp** | ✅ MM:SS format | ✅ Word/segment level |
+            | **Pricing** | Free tier tersedia | Pay-per-use |
+            
+            ### Langkah Penggunaan:
+            1. **Dapatkan API Key** di [Google AI Studio](https://aistudio.google.com/app/apikey)
+            2. **Set GOOGLE_API_KEY** di file `.env`
+            3. **Upload file AAC** (atau MP3/WAV/FLAC/OGG)
+            4. **Pilih mode transkripsi**:
+               - *Simple*: Cepat, hanya teks
+               - *Structured*: Dengan timestamp & speaker labels
+               - *Advanced*: Custom prompt untuk kontrol penuh
+            
+            ### Format Audio yang Didukung [^2^]:
+            - AAC (`audio/aac`) ⭐ **Native support!**
+            - MP3 (`audio/mp3`)
+            - WAV (`audio/wav`)
+            - AIFF (`audio/aiff`)
+            - OGG Vorbis (`audio/ogg`)
+            - FLAC (`audio/flac`)
+            """)
+        
+        with st.expander("🔑 Cara Mendapatkan API Key"):
+            st.markdown("""
+            1. Kunjungi [Google AI Studio](https://aistudio.google.com/app/apikey)
+            2. Klik **"Create API Key"**
+            3. Pilih project (atau buat baru)
+            4. Copy API Key ke file `.env`:
+               ```
+               GOOGLE_API_KEY=your-api-key-here
+               ```
+            5. **Gratis!** Ada free tier dengan limit harian.
             """)
 
 
