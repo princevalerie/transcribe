@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 import streamlit as st
-from openai import OpenAI
+from openai import OpenAI, APIStatusError
 from dotenv import load_dotenv
 import imageio_ffmpeg
 
@@ -27,7 +27,6 @@ AudioSegment.converter = _FFMPEG_EXE
 if _FFPROBE_EXE and os.path.exists(_FFPROBE_EXE):
     AudioSegment.ffprobe = _FFPROBE_EXE
 else:
-    # Fallback: biarkan pydub cari di PATH (bisa error kalau nggak ada)
     AudioSegment.ffprobe = "ffprobe"
 
 # ═══════════════════════════════════════════════════════════════
@@ -55,6 +54,8 @@ st.markdown("""
     .info-box { background-color: #e8f4f8; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
     .status-ok { color: #28a745; font-weight: bold; }
     .status-err { color: #dc3545; font-weight: bold; }
+    .status-warn { color: #ffc107; font-weight: bold; }
+    .fallback-banner { background-color: #fff3cd; border: 1px solid #ffc107; padding: 10px; border-radius: 5px; margin-bottom: 10px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -69,16 +70,15 @@ def convert_aac_to_supported(input_path: str, output_format: str = "mp3") -> str
     """
     out_file = tempfile.mktemp(suffix=f".{output_format}")
 
-    # ── Layer 1: Coba pydub ──
+    # Layer 1: pydub
     try:
-        # Explicit format="aac" supaya pydub nggak perlu ffprobe untuk detect
         audio = AudioSegment.from_file(input_path, format="aac")
         audio.export(out_file, format=output_format)
         return out_file
     except Exception:
-        pass  # Lanjut ke Layer 2
+        pass
 
-    # ── Layer 2: Fallback subprocess ffmpeg ──
+    # Layer 2: subprocess ffmpeg langsung
     cmd = [
         _FFMPEG_EXE,
         "-y", "-hide_banner", "-loglevel", "error",
@@ -94,15 +94,13 @@ def convert_aac_to_supported(input_path: str, output_format: str = "mp3") -> str
 
 def split_audio_ffmpeg(file_path: str, chunk_size_mb: int = 20) -> list:
     """
-    Split file besar pakai ffmpeg segment. 
-    Tidak butuh ffprobe / pydub.
+    Split file besar pakai ffmpeg segment. Tidak butuh ffprobe.
     """
     file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
     if file_size_mb <= chunk_size_mb:
         return [file_path]
 
-    # Estimate segment_time: asumsi MP3 192kbps ≈ 1.4 MB/menit
-    segment_minutes = max(int(chunk_size_mb / 1.4), 3)  # minimal 3 menit
+    segment_minutes = max(int(chunk_size_mb / 1.4), 3)
     segment_time_sec = segment_minutes * 60
 
     temp_dir = tempfile.mkdtemp()
@@ -131,23 +129,40 @@ def split_audio_ffmpeg(file_path: str, chunk_size_mb: int = 20) -> list:
     return chunks
 
 
-def transcribe_file(file_path: str, model: str, response_format: str,
-                    prompt: str = None, language: str = None) -> dict:
-    """Kirim file ke OpenAI Audio Transcriptions API."""
+def call_transcribe_api(file_path: str, model: str, response_format: str,
+                        prompt: str = None, language: str = None, attempt_fallback: bool = True):
+    """
+    Kirim file ke OpenAI Audio Transcriptions API.
+    Kalau 403 model_not_found, auto-fallback ke whisper-1.
+    """
     with open(file_path, "rb") as audio:
         kwargs = {
             "model": model,
             "file": audio,
             "response_format": response_format,
         }
+        # Prompt hanya untuk GPT-4o models
         if prompt and model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
             kwargs["prompt"] = prompt
         if language:
             kwargs["language"] = language
-        return client.audio.transcriptions.create(**kwargs)
+
+        try:
+            return client.audio.transcriptions.create(**kwargs), model
+        except APIStatusError as e:
+            if e.status_code == 403 and "model_not_found" in str(e).lower() and attempt_fallback:
+                st.warning("⚠️ Model GPT-4o Transcribe tidak tersedia di project ini. Fallback ke `whisper-1`...")
+                # Retry dengan whisper-1
+                kwargs["model"] = "whisper-1"
+                # Hapus prompt kalau whisper-1 (tidak support sama baik)
+                if "prompt" in kwargs:
+                    del kwargs["prompt"]
+                return client.audio.transcriptions.create(**kwargs), "whisper-1"
+            else:
+                raise
 
 
-def transcribe_diarize(file_path: str, response_format: str = "diarized_json") -> dict:
+def transcribe_diarize(file_path: str, response_format: str = "diarized_json"):
     """Transkripsi dengan speaker diarization."""
     with open(file_path, "rb") as audio:
         return client.audio.transcriptions.create(
@@ -163,31 +178,41 @@ def transcribe_diarize(file_path: str, response_format: str = "diarized_json") -
 # ═══════════════════════════════════════════════════════════════
 def main():
     st.markdown('<div class="main-header">🎙️ AAC to Text Transcriber</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Transkripsi AAC ke teks pakai OpenAI GPT — tanpa install FFmpeg manual</div>',
+    st.markdown('<div class="sub-header">Transkripsi AAC ke teks pakai OpenAI — Auto fallback ke whisper-1</div>',
                 unsafe_allow_html=True)
 
     # ── Sidebar ──
     with st.sidebar:
         st.header("⚙️ Konfigurasi")
 
-        # Status FFmpeg
+        # Status tools
         if os.path.exists(_FFMPEG_EXE):
-            st.markdown(f'<span class="status-ok">✅ FFmpeg ready</span>', unsafe_allow_html=True)
+            st.markdown('<span class="status-ok">✅ FFmpeg ready</span>', unsafe_allow_html=True)
         else:
-            st.markdown(f'<span class="status-err">❌ FFmpeg not found</span>', unsafe_allow_html=True)
+            st.markdown('<span class="status-err">❌ FFmpeg not found</span>', unsafe_allow_html=True)
 
         if _FFPROBE_EXE and os.path.exists(_FFPROBE_EXE):
-            st.markdown(f'<span class="status-ok">✅ FFprobe ready</span>', unsafe_allow_html=True)
+            st.markdown('<span class="status-ok">✅ FFprobe ready</span>', unsafe_allow_html=True)
         else:
-            st.markdown(f'<span class="status-err">⚠️ FFprobe fallback to subprocess</span>', unsafe_allow_html=True)
+            st.markdown('<span class="status-warn">⚠️ FFprobe fallback mode</span>', unsafe_allow_html=True)
 
+        st.divider()
+
+        # Model selection dengan info akses
         model = st.selectbox(
-            "Model",
-            ["gpt-4o-mini-transcribe", "gpt-4o-transcribe",
-             "gpt-4o-transcribe-diarize", "whisper-1"],
-            index=0,
-            help="gpt-4o-mini: cepat & murah | gpt-4o: akurasi tinggi | diarize: identifikasi speaker"
+            "Pilih Model",
+            options=[
+                "gpt-4o-mini-transcribe",
+                "gpt-4o-transcribe",
+                "gpt-4o-transcribe-diarize",
+                "whisper-1"
+            ],
+            index=3,  # Default whisper-1 (paling aman)
+            help="whisper-1: tersedia semua | gpt-4o*: butuh akses khusus/beta"
         )
+
+        if model != "whisper-1":
+            st.markdown('<span class="status-warn">⚠️ Model ini butuh akses khusus. Akan auto-fallback ke whisper-1 kalau 403.</span>', unsafe_allow_html=True)
 
         # Format output
         if model == "gpt-4o-transcribe-diarize":
@@ -198,13 +223,19 @@ def main():
             fmt_opts = ["text", "json"]
         response_format = st.selectbox("Format Output", fmt_opts, index=0)
 
-        language = st.text_input("Kode Bahasa (ISO 639-1)", value=os.getenv("LANGUAGE", "id"),
-                                 help="id=Indonesia, en=English, ja=Japanese, dst")
+        language = st.text_input(
+            "Kode Bahasa (ISO 639-1)",
+            value=os.getenv("LANGUAGE", "id"),
+            help="id=Indonesia, en=English, ja=Japanese, dst"
+        )
 
         prompt = None
         if model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
-            p = st.text_area("Prompt (opsional)", placeholder="Contoh: 'Percakapan tentang teknologi AI...'",
-                             help="Konteks untuk meningkatkan akurasi")
+            p = st.text_area(
+                "Prompt (opsional)",
+                placeholder="Contoh: 'Percakapan tentang teknologi AI...'",
+                help="Konteks untuk meningkatkan akurasi (hanya GPT-4o)"
+            )
             prompt = p if p.strip() else None
 
     # ── Main ──
@@ -258,16 +289,22 @@ def main():
 
                     # Proses tiap chunk
                     full_result = []
+                    used_model = model
                     bar = st.progress(0, text="Memulai…")
 
                     for i, chunk in enumerate(chunks):
                         bar.progress((i) / len(chunks), text=f"Chunk {i+1}/{len(chunks)}…")
 
                         if model == "gpt-4o-transcribe-diarize":
+                            # Diarize tidak support fallback otomatis di sini (karena format beda)
+                            # Jika 403, user harus ganti manual ke whisper-1
                             res = transcribe_diarize(chunk, response_format)
+                            used_model = "gpt-4o-transcribe-diarize"
                         else:
-                            res = transcribe_file(chunk, model, response_format,
-                                                  prompt=prompt, language=language)
+                            res, used_model = call_transcribe_api(
+                                chunk, model, response_format,
+                                prompt=prompt, language=language, attempt_fallback=True
+                            )
 
                         if response_format == "text":
                             full_result.append(res)
@@ -279,14 +316,19 @@ def main():
                             os.unlink(chunk)
 
                     bar.progress(1.0, text="Selesai!")
-                    st.success("✅ Transkripsi selesai!")
+
+                    # Banner info model yang benar-benar digunakan
+                    if used_model != model:
+                        st.markdown(f'<div class="fallback-banner">ℹ️ Digunakan model: <b>{used_model}</b> (fallback dari {model})</div>', unsafe_allow_html=True)
+                    else:
+                        st.success(f"✅ Transkripsi selesai! (Model: {used_model})")
+
                     st.divider()
 
                     # ── Tampilkan hasil ──
                     st.subheader("📝 Hasil Transkripsi")
 
                     if response_format == "diarized_json":
-                        # Gabungkan segments dari tiap chunk
                         all_segments = []
                         for r in full_result:
                             if hasattr(r, 'segments'):
@@ -327,24 +369,34 @@ def main():
                     if need_convert and os.path.exists(file_proc):
                         os.unlink(file_proc)
 
+                except APIStatusError as api_err:
+                    if api_err.status_code == 403:
+                        st.error(f"❌ Error 403: API Key tidak punya akses ke model ini.")
+                        st.info("💡 Solusi: Pilih **whisper-1** di sidebar (tersedia untuk semua), atau cek billing/project di dashboard.openai.com")
+                    else:
+                        st.error(f"❌ API Error: {api_err}")
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
-                    st.info("💡 Pastikan API key valid di file `.env`. Kalau error FFmpeg, coba restart Streamlit.")
+                    st.info("💡 Pastikan API key valid di file `.env`.")
 
     else:
         st.info("👆 Upload file audio untuk mulai")
-        with st.expander("📖 Cara Penggunaan"):
+        with st.expander("📖 Cara Penggunaan & Troubleshooting"):
             st.markdown("""
-            **Langkah:**
+            ### Langkah Penggunaan
             1. Upload file `.aac` (atau MP3/WAV/M4A)
-            2. Pilih model (gpt-4o-mini-transcribe recommended)
+            2. Pilih model — **whisper-1** paling aman (tersedia semua)
             3. Klik **Mulai Transkripsi**
 
-            **Fitur:**
-            - Konversi AAC otomatis (tanpa install FFmpeg manual)
-            - Auto-split file >25 MB
-            - Speaker diarization (model diarize)
-            - Download hasil TXT
+            ### Error 403 / Model Not Found?
+            Model `gpt-4o-transcribe`, `gpt-4o-mini-transcribe`, dan `gpt-4o-transcribe-diarize` **butuh akses khusus** dan belum tersedia untuk semua project OpenAI.
+
+            **Solusi:**
+            - Pilih **whisper-1** (default) — tersedia untuk semua API key
+            - Kalau tetap mau GPT-4o, cek di [dashboard.openai.com](https://dashboard.openai.com) apakah model sudah di-enable
+
+            ### Error FFmpeg?
+            Sudah di-handle otomatis oleh `imageio-ffmpeg`. Tidak perlu install manual.
             """)
 
 
