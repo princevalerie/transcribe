@@ -1,20 +1,44 @@
 import os
 import base64
 import tempfile
+import subprocess
+import glob
+import shutil
 from pathlib import Path
 
 import streamlit as st
 from openai import OpenAI
 from dotenv import load_dotenv
+import imageio_ffmpeg
+
+# ═══════════════════════════════════════════════════════════════
+# FIX FFMPEG / FFPROBE PATH (auto-detect dari imageio-ffmpeg)
+# ═══════════════════════════════════════════════════════════════
+_FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
+_FFMPEG_DIR = os.path.dirname(_FFMPEG_EXE)
+
+# Cari ffprobe di folder yang sama dengan ffmpeg
+_FFPROBE_CANDIDATES = glob.glob(os.path.join(_FFMPEG_DIR, "*ffprobe*"))
+_FFPROBE_EXE = _FFPROBE_CANDIDATES[0] if _FFPROBE_CANDIDATES else shutil.which("ffprobe")
+
+# Setup pydub untuk pakai binary dari imageio-ffmpeg
 from pydub import AudioSegment
+AudioSegment.converter = _FFMPEG_EXE
+if _FFPROBE_EXE and os.path.exists(_FFPROBE_EXE):
+    AudioSegment.ffprobe = _FFPROBE_EXE
+else:
+    # Fallback: biarkan pydub cari di PATH (bisa error kalau nggak ada)
+    AudioSegment.ffprobe = "ffprobe"
 
-# Load environment variables
+# ═══════════════════════════════════════════════════════════════
+# LOAD ENV & INIT CLIENT
+# ═══════════════════════════════════════════════════════════════
 load_dotenv()
-
-# Initialize OpenAI client
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Page configuration
+# ═══════════════════════════════════════════════════════════════
+# STREAMLIT CONFIG
+# ═══════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="AAC to Text Transcriber",
     page_icon="🎙️",
@@ -22,386 +46,307 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS
 st.markdown("""
 <style>
-    .main-header {
-        font-size: 2.5rem;
-        font-weight: bold;
-        color: #1f77b4;
-        margin-bottom: 1rem;
-    }
-    .sub-header {
-        font-size: 1.2rem;
-        color: #666;
-        margin-bottom: 2rem;
-    }
-    .stButton>button {
-        width: 100%;
-        height: 3rem;
-        font-size: 1.1rem;
-    }
-    .transcript-box {
-        background-color: #f0f2f6;
-        padding: 20px;
-        border-radius: 10px;
-        border-left: 4px solid #1f77b4;
-    }
-    .info-box {
-        background-color: #e8f4f8;
-        padding: 15px;
-        border-radius: 8px;
-        margin-bottom: 20px;
-    }
+    .main-header { font-size: 2.5rem; font-weight: bold; color: #1f77b4; margin-bottom: 1rem; }
+    .sub-header { font-size: 1.2rem; color: #666; margin-bottom: 2rem; }
+    .stButton>button { width: 100%; height: 3rem; font-size: 1.1rem; }
+    .transcript-box { background-color: #f0f2f6; padding: 20px; border-radius: 10px; border-left: 4px solid #1f77b4; }
+    .info-box { background-color: #e8f4f8; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+    .status-ok { color: #28a745; font-weight: bold; }
+    .status-err { color: #dc3545; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
-def convert_aac_to_supported_format(input_path, output_format="mp3"):
-    """
-    Convert AAC file to a format supported by OpenAI API (mp3, mp4, mpeg, mpga, m4a, wav, webm)
-    """
-    audio = AudioSegment.from_file(input_path, format="aac")
-    
-    # Create temporary file
-    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=f".{output_format}")
-    audio.export(temp_file.name, format=output_format)
-    
-    return temp_file.name
+# ═══════════════════════════════════════════════════════════════
+# AUDIO UTILITIES
+# ═══════════════════════════════════════════════════════════════
 
-def transcribe_audio(file_path, model, response_format, prompt=None, language=None, chunking_strategy=None):
+def convert_aac_to_supported(input_path: str, output_format: str = "mp3") -> str:
     """
-    Transcribe audio using OpenAI API
+    Konversi AAC ke format yang didukung OpenAI (mp3/wav/m4a).
+    Layer 1: pydub | Layer 2: subprocess ffmpeg (fallback)
     """
-    with open(file_path, "rb") as audio_file:
-        params = {
-            "model": model,
-            "file": audio_file,
-            "response_format": response_format
-        }
-        
-        # Add optional parameters
-        if prompt and model in ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"]:
-            params["prompt"] = prompt
-            
-        if language:
-            params["language"] = language
-            
-        if chunking_strategy and model == "gpt-4o-transcribe-diarize":
-            params["extra_body"] = {"chunking_strategy": chunking_strategy}
-        
-        transcription = client.audio.transcriptions.create(**params)
-        
-    return transcription
+    out_file = tempfile.mktemp(suffix=f".{output_format}")
 
-def transcribe_with_diarization(file_path, model, response_format, known_speaker_names=None, known_speaker_references=None):
-    """
-    Transcribe audio with speaker diarization
-    """
-    def to_data_url(path):
-        with open(path, "rb") as fh:
-            return "data:audio/wav;base64," + base64.b64encode(fh.read()).decode("utf-8")
-    
-    with open(file_path, "rb") as audio_file:
-        extra_body = {"chunking_strategy": "auto"}
-        
-        if known_speaker_names and known_speaker_references:
-            extra_body["known_speaker_names"] = known_speaker_names
-            extra_body["known_speaker_references"] = [to_data_url(ref) for ref in known_speaker_references]
-        
-        transcription = client.audio.transcriptions.create(
-            model=model,
-            file=audio_file,
-            response_format=response_format,
-            extra_body=extra_body
-        )
-    
-    return transcription
+    # ── Layer 1: Coba pydub ──
+    try:
+        # Explicit format="aac" supaya pydub nggak perlu ffprobe untuk detect
+        audio = AudioSegment.from_file(input_path, format="aac")
+        audio.export(out_file, format=output_format)
+        return out_file
+    except Exception:
+        pass  # Lanjut ke Layer 2
 
-def split_audio(file_path, chunk_size_mb=20):
+    # ── Layer 2: Fallback subprocess ffmpeg ──
+    cmd = [
+        _FFMPEG_EXE,
+        "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+        out_file
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Gagal konversi audio:\n{result.stderr}")
+    return out_file
+
+
+def split_audio_ffmpeg(file_path: str, chunk_size_mb: int = 20) -> list:
     """
-    Split large audio files into chunks (max 25MB per OpenAI limit)
+    Split file besar pakai ffmpeg segment. 
+    Tidak butuh ffprobe / pydub.
     """
-    audio = AudioSegment.from_file(file_path)
-    
-    # Calculate chunk duration in milliseconds
-    # Approximate: 1MB ≈ 1 minute for MP3 at 128kbps
-    chunk_duration_ms = (chunk_size_mb * 60 * 1000) // 1.5
-    
-    chunks = []
-    for i in range(0, len(audio), chunk_duration_ms):
-        chunk = audio[i:i + chunk_duration_ms]
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        chunk.export(temp_file.name, format="mp3")
-        chunks.append(temp_file.name)
-    
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    if file_size_mb <= chunk_size_mb:
+        return [file_path]
+
+    # Estimate segment_time: asumsi MP3 192kbps ≈ 1.4 MB/menit
+    segment_minutes = max(int(chunk_size_mb / 1.4), 3)  # minimal 3 menit
+    segment_time_sec = segment_minutes * 60
+
+    temp_dir = tempfile.mkdtemp()
+    base_name = Path(file_path).stem
+    pattern = os.path.join(temp_dir, f"{base_name}_%03d.mp3")
+
+    cmd = [
+        _FFMPEG_EXE,
+        "-y", "-hide_banner", "-loglevel", "error",
+        "-i", file_path,
+        "-f", "segment",
+        "-segment_time", str(segment_time_sec),
+        "-c", "copy",
+        "-reset_timestamps", "1",
+        pattern
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"Gagal split audio:\n{result.stderr}")
+
+    chunks = sorted([
+        os.path.join(temp_dir, f)
+        for f in os.listdir(temp_dir)
+        if f.startswith(base_name) and f.endswith(".mp3")
+    ])
     return chunks
 
+
+def transcribe_file(file_path: str, model: str, response_format: str,
+                    prompt: str = None, language: str = None) -> dict:
+    """Kirim file ke OpenAI Audio Transcriptions API."""
+    with open(file_path, "rb") as audio:
+        kwargs = {
+            "model": model,
+            "file": audio,
+            "response_format": response_format,
+        }
+        if prompt and model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
+            kwargs["prompt"] = prompt
+        if language:
+            kwargs["language"] = language
+        return client.audio.transcriptions.create(**kwargs)
+
+
+def transcribe_diarize(file_path: str, response_format: str = "diarized_json") -> dict:
+    """Transkripsi dengan speaker diarization."""
+    with open(file_path, "rb") as audio:
+        return client.audio.transcriptions.create(
+            model="gpt-4o-transcribe-diarize",
+            file=audio,
+            response_format=response_format,
+            extra_body={"chunking_strategy": "auto"}
+        )
+
+
+# ═══════════════════════════════════════════════════════════════
+# UI
+# ═══════════════════════════════════════════════════════════════
 def main():
-    # Header
     st.markdown('<div class="main-header">🎙️ AAC to Text Transcriber</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">Transkripsi file audio AAC ke teks menggunakan AI GPT Models</div>', unsafe_allow_html=True)
-    
-    # Sidebar configuration
+    st.markdown('<div class="sub-header">Transkripsi AAC ke teks pakai OpenAI GPT — tanpa install FFmpeg manual</div>',
+                unsafe_allow_html=True)
+
+    # ── Sidebar ──
     with st.sidebar:
         st.header("⚙️ Konfigurasi")
-        
-        # Model selection
-        model = st.selectbox(
-            "Pilih Model",
-            options=[
-                "gpt-4o-mini-transcribe",
-                "gpt-4o-transcribe", 
-                "gpt-4o-transcribe-diarize",
-                "whisper-1"
-            ],
-            index=0,
-            help="gpt-4o-mini-transcribe: cepat & ekonomis | gpt-4o-transcribe: akurasi tinggi | gpt-4o-transcribe-diarize: dengan identifikasi speaker"
-        )
-        
-        # Response format
-        if model == "gpt-4o-transcribe-diarize":
-            response_format = st.selectbox(
-                "Format Output",
-                options=["diarized_json", "json", "text"],
-                index=0
-            )
-        elif model == "whisper-1":
-            response_format = st.selectbox(
-                "Format Output",
-                options=["json", "text", "srt", "verbose_json", "vtt"],
-                index=1
-            )
+
+        # Status FFmpeg
+        if os.path.exists(_FFMPEG_EXE):
+            st.markdown(f'<span class="status-ok">✅ FFmpeg ready</span>', unsafe_allow_html=True)
         else:
-            response_format = st.selectbox(
-                "Format Output",
-                options=["text", "json"],
-                index=0
-            )
-        
-        # Language
-        language = st.text_input(
-            "Kode Bahasa (ISO 639-1)",
-            value=os.getenv("LANGUAGE", "id"),
-            help="Contoh: id (Indonesia), en (English), ja (Japanese)"
+            st.markdown(f'<span class="status-err">❌ FFmpeg not found</span>', unsafe_allow_html=True)
+
+        if _FFPROBE_EXE and os.path.exists(_FFPROBE_EXE):
+            st.markdown(f'<span class="status-ok">✅ FFprobe ready</span>', unsafe_allow_html=True)
+        else:
+            st.markdown(f'<span class="status-err">⚠️ FFprobe fallback to subprocess</span>', unsafe_allow_html=True)
+
+        model = st.selectbox(
+            "Model",
+            ["gpt-4o-mini-transcribe", "gpt-4o-transcribe",
+             "gpt-4o-transcribe-diarize", "whisper-1"],
+            index=0,
+            help="gpt-4o-mini: cepat & murah | gpt-4o: akurasi tinggi | diarize: identifikasi speaker"
         )
-        
-        # Prompt (for GPT-4o models)
-        prompt = None
-        if model in ["gpt-4o-transcribe", "gpt-4o-mini-transcribe"]:
-            prompt = st.text_area(
-                "Prompt (Opsional)",
-                placeholder="Contoh: 'Transkripsi berikut adalah percakapan tentang teknologi AI...'",
-                help="Bantu model dengan konteks untuk meningkatkan akurasi transkripsi"
-            )
-            if prompt == "":
-                prompt = None
-        
-        # Diarization options
-        enable_diarization = False
+
+        # Format output
         if model == "gpt-4o-transcribe-diarize":
-            enable_diarization = st.checkbox("Aktifkan Speaker Diarization", value=True)
-        
-        st.divider()
-        st.info(f"**Model:** {model}\n**Format:** {response_format}\n**Bahasa:** {language}")
-    
-    # Main content
-    st.markdown('<div class="info-box">📁 <b>Upload file AAC</b> (maksimal 25MB). File AAC akan dikonversi otomatis ke format yang didukung.</div>', unsafe_allow_html=True)
-    
-    # File uploader
-    uploaded_file = st.file_uploader(
-        "Pilih file AAC",
+            fmt_opts = ["diarized_json", "json", "text"]
+        elif model == "whisper-1":
+            fmt_opts = ["json", "text", "srt", "verbose_json", "vtt"]
+        else:
+            fmt_opts = ["text", "json"]
+        response_format = st.selectbox("Format Output", fmt_opts, index=0)
+
+        language = st.text_input("Kode Bahasa (ISO 639-1)", value=os.getenv("LANGUAGE", "id"),
+                                 help="id=Indonesia, en=English, ja=Japanese, dst")
+
+        prompt = None
+        if model in ("gpt-4o-transcribe", "gpt-4o-mini-transcribe"):
+            p = st.text_area("Prompt (opsional)", placeholder="Contoh: 'Percakapan tentang teknologi AI...'",
+                             help="Konteks untuk meningkatkan akurasi")
+            prompt = p if p.strip() else None
+
+    # ── Main ──
+    st.markdown(
+        '<div class="info-box">📁 <b>Upload file audio</b> (AAC/MP3/WAV/M4A/MP4, max 25MB per chunk).</div>',
+        unsafe_allow_html=True)
+
+    uploaded = st.file_uploader(
+        "Pilih file",
         type=["aac", "m4a", "mp3", "wav", "mp4", "mpeg", "webm"],
-        help="Format yang didukung: AAC, M4A, MP3, WAV, MP4, MPEG, WEBM"
+        help="AAC akan dikonversi otomatis ke MP3"
     )
-    
-    if uploaded_file is not None:
-        # Display file info
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Nama File", uploaded_file.name[:20] + "..." if len(uploaded_file.name) > 20 else uploaded_file.name)
-        with col2:
-            file_size = len(uploaded_file.getvalue()) / (1024 * 1024)
-            st.metric("Ukuran", f"{file_size:.2f} MB")
-        with col3:
-            st.metric("Format", uploaded_file.type or "AAC")
-        
-        # Audio player
-        st.audio(uploaded_file, format="audio/aac")
-        
-        # Transcribe button
+
+    if uploaded:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Nama", uploaded.name[:18] + "…" if len(uploaded.name) > 18 else uploaded.name)
+        size_mb = len(uploaded.getvalue()) / (1024 * 1024)
+        c2.metric("Ukuran", f"{size_mb:.2f} MB")
+        c3.metric("Tipe", uploaded.type or "audio/aac")
+
+        st.audio(uploaded, format="audio/aac")
+
         st.divider()
-        
-        col_btn1, col_btn2, col_btn3 = st.columns([1, 2, 1])
-        with col_btn2:
-            transcribe_button = st.button("🚀 Mulai Transkripsi", type="primary", use_container_width=True)
-        
-        if transcribe_button:
-            with st.spinner("Memproses audio..."):
+        _, cbtn, _ = st.columns([1, 2, 1])
+        with cbtn:
+            go = st.button("🚀 Mulai Transkripsi", type="primary", use_container_width=True)
+
+        if go:
+            with st.spinner("Memproses audio…"):
                 try:
-                    # Save uploaded file temporarily
-                    temp_input = tempfile.NamedTemporaryFile(delete=False, suffix=".aac")
-                    temp_input.write(uploaded_file.getvalue())
-                    temp_input.close()
-                    
-                    # Convert AAC to MP3 if needed
-                    if uploaded_file.name.endswith('.aac'):
-                        st.info("🔄 Mengkonversi AAC ke MP3...")
-                        file_to_transcribe = convert_aac_to_supported_format(temp_input.name, "mp3")
+                    # Simpan upload ke temp file
+                    tmp_in = tempfile.NamedTemporaryFile(delete=False, suffix=".aac")
+                    tmp_in.write(uploaded.getvalue())
+                    tmp_in.close()
+
+                    # Konversi ke MP3 (OpenAI nggak support AAC raw)
+                    need_convert = uploaded.name.lower().endswith(".aac")
+                    if need_convert:
+                        st.info("🔄 Mengkonversi AAC → MP3…")
+                        file_proc = convert_aac_to_supported(tmp_in.name, "mp3")
                     else:
-                        file_to_transcribe = temp_input.name
-                    
-                    # Check file size
-                    file_size_mb = os.path.getsize(file_to_transcribe) / (1024 * 1024)
-                    
-                    if file_size_mb > 25:
-                        st.warning(f"⚠️ File terlalu besar ({file_size_mb:.1f} MB). Membagi menjadi chunk...")
-                        chunks = split_audio(file_to_transcribe)
-                        
-                        full_transcript = []
-                        progress_bar = st.progress(0)
-                        
-                        for idx, chunk_path in enumerate(chunks):
-                            st.text(f"Memproses chunk {idx + 1}/{len(chunks)}...")
-                            
-                            if model == "gpt-4o-transcribe-diarize" and enable_diarization:
-                                result = transcribe_with_diarization(
-                                    chunk_path, 
-                                    model, 
-                                    response_format
-                                )
-                            else:
-                                result = transcribe_audio(
-                                    chunk_path, 
-                                    model, 
-                                    response_format,
-                                    prompt=prompt,
-                                    language=language if language else None
-                                )
-                            
-                            if response_format == "text":
-                                full_transcript.append(result)
-                            else:
-                                full_transcript.append(result.text if hasattr(result, 'text') else str(result))
-                            
-                            progress_bar.progress((idx + 1) / len(chunks))
-                            
-                            # Clean up chunk
-                            os.unlink(chunk_path)
-                        
-                        # Combine transcripts
-                        if response_format == "diarized_json":
-                            # For diarized JSON, we need to merge segments properly
-                            combined_result = full_transcript
-                        else:
-                            combined_result = " ".join(full_transcript)
+                        file_proc = tmp_in.name
+
+                    # Split kalau >25 MB
+                    proc_size = os.path.getsize(file_proc) / (1024 * 1024)
+                    if proc_size > 25:
+                        st.warning(f"⚠️ File besar ({proc_size:.1f} MB), splitting…")
+                        chunks = split_audio_ffmpeg(file_proc, chunk_size_mb=20)
                     else:
-                        # Single file transcription
-                        if model == "gpt-4o-transcribe-diarize" and enable_diarization:
-                            result = transcribe_with_diarization(
-                                file_to_transcribe, 
-                                model, 
-                                response_format
-                            )
+                        chunks = [file_proc]
+
+                    # Proses tiap chunk
+                    full_result = []
+                    bar = st.progress(0, text="Memulai…")
+
+                    for i, chunk in enumerate(chunks):
+                        bar.progress((i) / len(chunks), text=f"Chunk {i+1}/{len(chunks)}…")
+
+                        if model == "gpt-4o-transcribe-diarize":
+                            res = transcribe_diarize(chunk, response_format)
                         else:
-                            result = transcribe_audio(
-                                file_to_transcribe, 
-                                model, 
-                                response_format,
-                                prompt=prompt,
-                                language=language if language else None
-                            )
-                        
-                        combined_result = result
-                    
-                    # Clean up temp files
-                    os.unlink(temp_input.name)
-                    if uploaded_file.name.endswith('.aac'):
-                        os.unlink(file_to_transcribe)
-                    
-                    # Display results
+                            res = transcribe_file(chunk, model, response_format,
+                                                  prompt=prompt, language=language)
+
+                        if response_format == "text":
+                            full_result.append(res)
+                        else:
+                            full_result.append(res.text if hasattr(res, "text") else str(res))
+
+                        # Hapus chunk temp (kecuali original)
+                        if chunk != file_proc:
+                            os.unlink(chunk)
+
+                    bar.progress(1.0, text="Selesai!")
                     st.success("✅ Transkripsi selesai!")
                     st.divider()
-                    
+
+                    # ── Tampilkan hasil ──
                     st.subheader("📝 Hasil Transkripsi")
-                    
-                    # Handle different response formats
-                    if response_format == "diarized_json" and enable_diarization:
-                        st.json(combined_result.segments if hasattr(combined_result, 'segments') else combined_result)
-                        
-                        # Display formatted diarized text
-                        st.subheader("📋 Format Speaker")
-                        if hasattr(combined_result, 'segments'):
-                            for segment in combined_result.segments:
-                                speaker = getattr(segment, 'speaker', 'Unknown')
-                                text = getattr(segment, 'text', '')
-                                start = getattr(segment, 'start', 0)
-                                end = getattr(segment, 'end', 0)
-                                
-                                col_speaker, col_text = st.columns([1, 4])
-                                with col_speaker:
-                                    st.markdown(f"**🎤 {speaker}**")
-                                    st.caption(f"{start:.1f}s - {end:.1f}s")
-                                with col_text:
-                                    st.info(text)
-                    
-                    elif response_format == "json":
-                        st.json(combined_result)
-                    
-                    elif response_format == "verbose_json":
-                        st.json(combined_result)
-                    
+
+                    if response_format == "diarized_json":
+                        # Gabungkan segments dari tiap chunk
+                        all_segments = []
+                        for r in full_result:
+                            if hasattr(r, 'segments'):
+                                all_segments.extend(r.segments)
+                            elif isinstance(r, dict) and 'segments' in r:
+                                all_segments.extend(r['segments'])
+
+                        if all_segments:
+                            for seg in all_segments:
+                                spk = getattr(seg, 'speaker', 'Unknown')
+                                txt = getattr(seg, 'text', '')
+                                s = getattr(seg, 'start', 0)
+                                e = getattr(seg, 'end', 0)
+                                col1, col2 = st.columns([1, 4])
+                                col1.markdown(f"**🎤 {spk}**")
+                                col1.caption(f"{s:.1f}s – {e:.1f}s")
+                                col2.info(txt)
+                        else:
+                            st.json([r for r in full_result])
+
+                    elif response_format in ("json", "verbose_json"):
+                        st.json(full_result[0] if len(full_result) == 1 else full_result)
+
                     else:
-                        # Plain text
-                        transcript_text = combined_result.text if hasattr(combined_result, 'text') else str(combined_result)
-                        
-                        st.markdown(f'<div class="transcript-box">{transcript_text}</div>', unsafe_allow_html=True)
-                        
-                        # Copy button
-                        st.code(transcript_text, language="text")
-                        
-                        # Download button
+                        final_text = " ".join(full_result) if isinstance(full_result, list) else full_result
+                        if hasattr(final_text, 'text'):
+                            final_text = final_text.text
+                        st.markdown(f'<div class="transcript-box">{final_text}</div>', unsafe_allow_html=True)
+                        st.code(final_text, language="text")
                         st.download_button(
-                            label="💾 Download Transkripsi",
-                            data=transcript_text,
-                            file_name=f"{uploaded_file.name.rsplit('.', 1)[0]}_transcript.txt",
+                            "💾 Download TXT", data=str(final_text),
+                            file_name=f"{uploaded.name.rsplit('.', 1)[0]}_transcript.txt",
                             mime="text/plain"
                         )
-                    
-                    # Show raw response for debugging
-                    with st.expander("🔍 Lihat Response Lengkap"):
-                        st.write(combined_result)
-                        
+
+                    # Cleanup
+                    os.unlink(tmp_in.name)
+                    if need_convert and os.path.exists(file_proc):
+                        os.unlink(file_proc)
+
                 except Exception as e:
                     st.error(f"❌ Error: {str(e)}")
-                    st.info("💡 Tips: Pastikan API key valid dan file tidak corrupt.")
-    
+                    st.info("💡 Pastikan API key valid di file `.env`. Kalau error FFmpeg, coba restart Streamlit.")
+
     else:
-        # Show sample/info when no file uploaded
-        st.info("👆 Upload file AAC untuk memulai transkripsi")
-        
+        st.info("👆 Upload file audio untuk mulai")
         with st.expander("📖 Cara Penggunaan"):
             st.markdown("""
-            ### Langkah-langkah:
-            1. **Upload File**: Pilih file AAC dari komputer Anda
-            2. **Pilih Model**: 
-               - `gpt-4o-mini-transcribe`: Cepat dan hemat biaya
-               - `gpt-4o-transcribe`: Akurasi tinggi
-               - `gpt-4o-transcribe-diarize`: Dengan identifikasi speaker
-               - `whisper-1`: Model klasik Whisper
-            3. **Konfigurasi**: Atur bahasa, format output, dan prompt (opsional)
-            4. **Transkripsi**: Klik tombol "Mulai Transkripsi"
-            
-            ### Fitur:
-            - ✅ Konversi otomatis AAC ke format yang didukung
-            - ✅ Split file besar (>25MB) secara otomatis
-            - ✅ Speaker diarization (identifikasi pembicara)
-            - ✅ Multiple output formats (text, JSON, SRT, VTT)
-            - ✅ Download hasil transkripsi
-            
-            ### Batasan:
-            - Maksimal file size: 25MB per request (file besar akan di-split)
-            - Format AAC akan dikonversi ke MP3
+            **Langkah:**
+            1. Upload file `.aac` (atau MP3/WAV/M4A)
+            2. Pilih model (gpt-4o-mini-transcribe recommended)
+            3. Klik **Mulai Transkripsi**
+
+            **Fitur:**
+            - Konversi AAC otomatis (tanpa install FFmpeg manual)
+            - Auto-split file >25 MB
+            - Speaker diarization (model diarize)
+            - Download hasil TXT
             """)
+
 
 if __name__ == "__main__":
     main()
